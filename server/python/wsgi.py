@@ -3,7 +3,7 @@
 # Contributor:
 #      Phus Lu        <phus.lu@gmail.com>
 
-__version__ = '2.1.11'
+__version__ = '2.1.12'
 __password__ = ''
 __hostsdeny__ = ()  # __hostsdeny__ = ('.youtube.com', '.youku.com')
 
@@ -241,6 +241,7 @@ def paas_application(environ, start_response):
         raise StopIteration
 
     timeout = Deadline
+    xorchar = ord(kwargs.get('xorchar') or '\x00')
 
     logging.info('%s "%s %s %s" - -', environ['REMOTE_ADDR'], method, url, 'HTTP/1.1')
 
@@ -266,7 +267,10 @@ def paas_application(environ, start_response):
                 if not data:
                     response.close()
                     break
-                yield data
+                if xorchar:
+                    yield ''.join(chr(ord(x)^xorchar) for x in data)
+                else:
+                    yield data
         except httplib.HTTPException as e:
             raise
 
@@ -317,6 +321,7 @@ def gae_application(environ, start_response):
         raise StopIteration
 
     deadline = Deadline
+    validate_certificate = bool(int(kwargs.get('validate', 0)))
     headers = dict(headers)
     headers['Connection'] = 'close'
     payload = environ['wsgi.input'].read() if 'Content-Length' in headers else None
@@ -331,7 +336,7 @@ def gae_application(environ, start_response):
     errors = []
     for i in xrange(int(kwargs.get('fetchmax', FetchMax))):
         try:
-            response = urlfetch.fetch(url, payload, fetchmethod, headers, allow_truncated=False, follow_redirects=False, deadline=deadline, validate_certificate=False)
+            response = urlfetch.fetch(url, payload, fetchmethod, headers, allow_truncated=False, follow_redirects=False, deadline=deadline, validate_certificate=validate_certificate)
             break
         except apiproxy_errors.OverQuotaError as e:
             time.sleep(5)
@@ -357,6 +362,9 @@ def gae_application(environ, start_response):
                 start = int(m.group(1))
                 headers['Range'] = 'bytes=%s-%d' % (start, start+int(kwargs.get('fetchmaxsize', FetchMaxSize)))
             deadline = Deadline * 2
+        except urlfetch.SSLCertificateError as e:
+            errors.append('%r, should validate=0 ?' % e)
+            logging.error('%r, deadline=%s', e, deadline)
         except Exception as e:
             errors.append(str(e))
             if i==0 and method=='GET':

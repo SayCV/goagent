@@ -1,11 +1,16 @@
 <?php
 
+// Note:
+//     Please try to use the https url to bypass keyword filtering.
+//     Otherwise, dont forgot set [paas]passowrd in proxy.ini
 // Contributor:
-//      Phus Lu        <phus.lu@gmail.com>
+//     Phus Lu        <phus.lu@gmail.com>
 
-$__version__  = '2.1.11';
+$__version__  = '2.1.12';
 $__password__ = '';
 $__timeout__  = 20;
+$__status__ = 0;
+$__xorchar__ = '';
 
 function decode_request($data) {
     list($headers_length) = array_values(unpack('n', substr($data, 0, 2)));
@@ -89,7 +94,11 @@ function header_function($ch, $header) {
 }
 
 function write_function($ch, $body) {
-    echo $body;
+    if ($GLOBALS['__xorchar__']) {
+        echo $body ^ str_repeat($GLOBALS['__xorchar__'], strlen($body));
+    } else {
+        echo $body;
+    }
     return strlen($body);
 }
 
@@ -97,23 +106,32 @@ function post()
 {
     list($method, $url, $headers, $kwargs, $body) = @decode_request(@file_get_contents('php://input'));
 
-    $password = $GLOBALS['__password__'];
-    if ($password) {
-        if (!isset($kwargs['password']) || $password != $kwargs['password']) {
+    if ($GLOBALS['__password__']) {
+        if (!isset($kwargs['password']) || $GLOBALS['__password__'] != $kwargs['password']) {
             header("HTTP/1.0 403 Forbidden");
             echo '403 Forbidden';
             exit(-1);
         }
     }
 
+    if (isset($kwargs['xorchar'])) {
+        $GLOBALS['__xorchar__'] = $kwargs['xorchar'];
+    }
+
+    $curl_opt = array();
+
+    $header_array = array();
     if ($body) {
         $headers['Content-Length'] = strval(strlen($body));
     }
     $headers['Connection'] = 'close';
+    foreach ($headers as $key => $value) {
+        if ($key) {
+            $header_array[] = join('-', array_map('ucfirst', explode('-', $key))).': '.$value;
+        }
+    }
 
-    $timeout = $GLOBALS['__timeout__'];
-
-    $curl_opt = array();
+    $curl_opt[CURLOPT_HTTPHEADER] = $header_array;
 
     $curl_opt[CURLOPT_RETURNTRANSFER] = true;
     $curl_opt[CURLOPT_BINARYTRANSFER] = true;
@@ -123,14 +141,19 @@ function post()
     $curl_opt[CURLOPT_WRITEFUNCTION]  = 'write_function';
 
 
-    $curl_opt[CURLOPT_FAILONERROR]    = true;
+    $curl_opt[CURLOPT_FAILONERROR]    = false;
     $curl_opt[CURLOPT_FOLLOWLOCATION] = false;
 
-    $curl_opt[CURLOPT_CONNECTTIMEOUT] = $timeout;
-    $curl_opt[CURLOPT_TIMEOUT]        = $timeout;
+    $curl_opt[CURLOPT_CONNECTTIMEOUT] = $GLOBALS['__timeout__'];
+    $curl_opt[CURLOPT_TIMEOUT]        = $GLOBALS['__timeout__'];
 
-    $curl_opt[CURLOPT_SSL_VERIFYPEER] = false;
-    $curl_opt[CURLOPT_SSL_VERIFYHOST] = false;
+    if (isset($kwargs['validate']) && @strval($kwargs['validate'])) {
+        $curl_opt[CURLOPT_SSL_VERIFYPEER] = true;
+        $curl_opt[CURLOPT_SSL_VERIFYHOST] = true;
+    } else {
+        $curl_opt[CURLOPT_SSL_VERIFYPEER] = false;
+        $curl_opt[CURLOPT_SSL_VERIFYHOST] = false;
+    }
 
     switch (strtoupper($method)) {
         case 'HEAD':
@@ -144,34 +167,35 @@ function post()
             break;
         case 'PUT':
         case 'DELETE':
+        case 'OPTIONS':
+        case 'TRACE':
             $curl_opt[CURLOPT_CUSTOMREQUEST] = $method;
             $curl_opt[CURLOPT_POSTFIELDS] = $body;
             break;
         default:
-            echo 'Invalid Method: ' . var_export($method, true);
+            echo error_html("403 Forbidden", "Invalid Method: $method", "$method '$url'");
             exit(-1);
     }
 
-    $header_array = array();
-    foreach ($headers as $key => $value) {
-        if ($key) {
-            $header_array[] = join('-', array_map('ucfirst', explode('-', $key))).': '.$value;
-        }
-    }
-    $curl_opt[CURLOPT_HTTPHEADER] = $header_array;
-
     $ch = curl_init($url);
     curl_setopt_array($ch, $curl_opt);
-    $ret = curl_exec($ch);
+    curl_exec($ch);
     $errno = curl_errno($ch);
-    if ($errno && !isset($GLOBALS['__status__'])) {
+    if ($errno && !$GLOBALS['__status__']) {
+        header('HTTP/1.1 502 Bad Gateway');
         echo error_html("cURL($errno)", "PHP Urlfetch Error: $method", curl_error($ch));
     }
     curl_close($ch);
 }
 
 function get() {
-    header('Location: https://www.google.com/');
+    $host = isset($_SERVER['HTTP_HOST']) ? $_SERVER['HTTP_HOST'] : $_SERVER['SERVER_NAME'];
+    $domain = preg_replace('/.*\\.(.+\\..+)$/', '$1', $host);
+    if ($host && $host != $domain && $host != 'www'.$domain) {
+        header('Location: http://www.' . $domain);
+    } else {
+        header('Location: https://www.google.com');
+    }
 }
 
 function main() {
