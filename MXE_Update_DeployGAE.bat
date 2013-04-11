@@ -12,7 +12,7 @@ set http_proxy=http://127.0.0.1:8087/
 set https_proxy=http://127.0.0.1:8087/
 
 cd server
-python.exe uploader.zip
+@"%~dp0..\local\python27.exe" uploader.zip
 
 :EOF
   PAUSE
