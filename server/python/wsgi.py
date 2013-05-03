@@ -3,7 +3,7 @@
 # Contributor:
 #      Phus Lu        <phus.lu@gmail.com>
 
-__version__ = '2.1.16'
+__version__ = '2.1.17'
 __password__ = ''
 __hostsdeny__ = ()  # __hostsdeny__ = ('.youtube.com', '.youku.com')
 
@@ -13,6 +13,7 @@ import re
 import time
 import struct
 import zlib
+import base64
 import logging
 import httplib
 import urlparse
@@ -44,6 +45,84 @@ URLFETCH_MAX = 2
 URLFETCH_MAXSIZE = 4*1024*1024
 URLFETCH_DEFLATE_MAXSIZE = 4*1024*1024
 URLFETCH_TIMEOUT = 60
+
+
+class base92:
+    """https://github.com/thenoviceoof/base92"""
+    @staticmethod
+    def encode(bytstr):
+        def base92_chr(val):
+            if val < 0 or val >= 91:
+                raise ValueError('val must be in [0, 91)')
+            if val == 0:
+                return '!'
+            elif val <= 61:
+                return chr(ord('#') + val - 1)
+            else:
+                return chr(ord('a') + val - 62)
+        # always encode *something*, in case we need to avoid empty strings
+        if not bytstr:
+            return '~'
+        # make sure we have a bytstr
+        if not isinstance(bytstr, basestring):
+            # we'll assume it's a sequence of ints
+            bytstr = ''.join([chr(b) for b in bytstr])
+        # prime the pump
+        bitstr = ''
+        while len(bitstr) < 13 and bytstr:
+            bitstr += '{:08b}'.format(ord(bytstr[0]))
+            bytstr = bytstr[1:]
+        resstr = ''
+        while len(bitstr) > 13 or bytstr:
+            i = int(bitstr[:13], 2)
+            resstr += base92_chr(i / 91)
+            resstr += base92_chr(i % 91)
+            bitstr = bitstr[13:]
+            while len(bitstr) < 13 and bytstr:
+                bitstr += '{:08b}'.format(ord(bytstr[0]))
+                bytstr = bytstr[1:]
+        if bitstr:
+            if len(bitstr) < 7:
+                bitstr += '0' * (6 - len(bitstr))
+                resstr += base92_chr(int(bitstr, 2))
+            else:
+                bitstr += '0' * (13 - len(bitstr))
+                i = int(bitstr, 2)
+                resstr += base92_chr(i / 91)
+                resstr += base92_chr(i % 91)
+        return resstr
+
+    @staticmethod
+    def decode(bstr):
+        def base92_ord(val):
+            num = ord(val)
+            if val == '!':
+                return 0
+            elif ord('#') <= num and num <= ord('_'):
+                return num - ord('#') + 1
+            elif ord('a') <= num and num <= ord('}'):
+                return num - ord('a') + 62
+            else:
+                raise ValueError('val is not a base92 character')
+        bitstr = ''
+        resstr = ''
+        if bstr == '~':
+            return ''
+        # we always have pairs of characters
+        for i in range(len(bstr)/2):
+            x = base92_ord(bstr[2*i])*91 + base92_ord(bstr[2*i+1])
+            bitstr += '{:013b}'.format(x)
+            while 8 <= len(bitstr):
+                resstr += chr(int(bitstr[0:8], 2))
+                bitstr = bitstr[8:]
+        # if we have an extra char, check for extras
+        if len(bstr) % 2 == 1:
+            x = base92_ord(bstr[-1])
+            bitstr += '{:06b}'.format(x)
+            while 8 <= len(bitstr):
+                resstr += chr(int(bitstr[0:8], 2))
+                bitstr = bitstr[8:]
+        return resstr
 
 
 def message_html(title, banner, detail=''):
@@ -85,7 +164,8 @@ A.u:link {color: green}
 
 
 def gae_application(environ, start_response):
-    if environ['REQUEST_METHOD'] == 'GET':
+    cookie = environ.get('HTTP_COOKIE', '')
+    if environ['REQUEST_METHOD'] == 'GET' and not cookie:
         if '204' in environ['QUERY_STRING']:
             start_response('204 No Content', [])
             yield ''
@@ -99,11 +179,14 @@ def gae_application(environ, start_response):
 
     # inflate = lambda x:zlib.decompress(x, -zlib.MAX_WBITS)
     wsgi_input = environ['wsgi.input']
-    data = wsgi_input.read(2)
-    metadata_length, = struct.unpack('!h', data)
-    metadata = wsgi_input.read(metadata_length)
+    if cookie:
+        metadata = zlib.decompress(base64.b64decode(cookie), -zlib.MAX_WBITS)
+    else:
+        data = wsgi_input.read(2)
+        metadata_length, = struct.unpack('!h', data)
+        metadata = wsgi_input.read(metadata_length)
+        metadata = zlib.decompress(metadata, -zlib.MAX_WBITS)
 
-    metadata = zlib.decompress(metadata, -zlib.MAX_WBITS)
     headers = dict(x.split(':', 1) for x in metadata.splitlines() if x)
     method = headers.pop('G-Method')
     url = headers.pop('G-Url')
@@ -148,7 +231,7 @@ def gae_application(environ, start_response):
     deadline = URLFETCH_TIMEOUT
     validate_certificate = bool(int(kwargs.get('validate', 0)))
     headers = dict(headers)
-    payload = environ['wsgi.input'].read() if 'Content-Length' in headers else None
+    payload = wsgi_input.read() if 'Content-Length' in headers else None
     if 'Content-Encoding' in headers:
         if headers['Content-Encoding'] == 'deflate':
             payload = zlib.decompress(payload, -zlib.MAX_WBITS)
