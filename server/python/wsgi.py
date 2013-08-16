@@ -3,7 +3,7 @@
 # Contributor:
 #      Phus Lu        <phus.lu@gmail.com>
 
-__version__ = '2.1.18'
+__version__ = '3.0.4'
 __password__ = ''
 __hostsdeny__ = ()  # __hostsdeny__ = ('.youtube.com', '.youku.com')
 
@@ -215,14 +215,8 @@ def gae_application(environ, start_response):
 
     data = response.content
     response_headers = response.headers
-    if response_headers.get('content-encoding') == 'gzip' and 'deflate' in accept_encoding and len(response.content) < URLFETCH_DEFLATE_MAXSIZE:
-        data = data[10:-8]
-        response_headers['Content-Encoding'] = 'deflate'
-    elif 'content-encoding' not in response_headers and len(response.content) < URLFETCH_DEFLATE_MAXSIZE and response_headers.get('content-type', '').startswith(('text/', 'application/json', 'application/javascript')):
-        if 'deflate' in accept_encoding:
-            response_headers['Content-Encoding'] = 'deflate'
-            data = zlib.compress(data)[2:-4]
-        elif 'gzip' in accept_encoding:
+    if 'content-encoding' not in response_headers and len(response.content) < URLFETCH_DEFLATE_MAXSIZE and response_headers.get('content-type', '').startswith(('text/', 'application/json', 'application/javascript')):
+        if 'gzip' in accept_encoding:
             response_headers['Content-Encoding'] = 'gzip'
             compressobj = zlib.compressobj(zlib.Z_DEFAULT_COMPRESSION, zlib.DEFLATED, -zlib.MAX_WBITS, zlib.DEF_MEM_LEVEL, 0)
             dataio = BytesIO()
@@ -231,7 +225,11 @@ def gae_application(environ, start_response):
             dataio.write(compressobj.flush())
             dataio.write(struct.pack('<LL', zlib.crc32(data) & 0xFFFFFFFFL, len(data) & 0xFFFFFFFFL))
             data = dataio.getvalue()
-    response_headers['Content-Length'] = str(len(data))
+        elif 'deflate' in accept_encoding:
+            response_headers['Content-Encoding'] = 'deflate'
+            data = zlib.compress(data)[2:-4]
+    if data:
+         response_headers['Content-Length'] = str(len(data))
     response_headers_data = zlib.compress('\n'.join('%s:%s' % (k.title(), v) for k, v in response_headers.items() if not k.startswith('x-google-')))[2:-4]
     start_response('200 OK', [('Content-Type', 'image/gif')])
     yield struct.pack('!hh', int(response.status_code), len(response_headers_data))+response_headers_data
