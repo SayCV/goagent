@@ -17,6 +17,7 @@
 #      Felix Yan      <felixonmars@gmail.com>
 #      Mort Yao       <mort.yao@gmail.com>
 #      Wang Wei Qiang <wwqgtxx@gmail.com>
+#      Poly Rabbit    <mcx_221@foxmail.com>
 
 __version__ = '3.0.5'
 
@@ -480,19 +481,15 @@ class PacUtil(object):
         except ValueError:
             need_update = False
         try:
-            urlfilter_urls = common.PAC_URLFILTER.split('|')
-            urlfilter_content = '\r\n\r\n'.join(['Opera Preferences version 2.1', '[prefs]\r\nprioritize excludelist=1', '[include]\r\n*', '[exclude]'])
-            for urlfilter_url in urlfilter_urls:
-                logging.info('try download %r to update_pacfile(%r)', urlfilter_url, filename)
-                sub_content = opener.open(urlfilter_url).read()
-                urlfilter_content += sub_content[sub_content.index('[exclude]')+9:] + '\r\n'
-            logging.info('%r downloaded, try convert it with urlfilter2pac', urlfilter_urls)
+            logging.info('try download %r to update_pacfile(%r)', common.PAC_ADBLOCK, filename)
+            adblock_content = opener.open(common.PAC_ADBLOCK).read()
+            logging.info('%r downloaded, try convert it with adblock2pac', common.PAC_ADBLOCK)
             if 'gevent' in sys.modules and time.sleep is getattr(sys.modules['gevent'], 'sleep', None) and hasattr(gevent.get_hub(), 'threadpool'):
-                jsrule = gevent.get_hub().threadpool.apply(PacUtil.urlfilter2pac, (urlfilter_content, 'FindProxyForURLByUrlfilter', blackhole, default))
+                jsrule = gevent.get_hub().threadpool.apply(PacUtil.adblock2pac, (adblock_content, 'FindProxyForURLByAdblock', blackhole, default))
             else:
-                jsrule = PacUtil.urlfilter2pac(urlfilter_content, 'FindProxyForURLByUrlfilter', blackhole, default)
+                jsrule = PacUtil.adblock2pac(adblock_content, 'FindProxyForURLByAdblock', blackhole, default)
             content += '\r\n' + jsrule + '\r\n'
-            logging.info('%r downloaded and parsed', common.PAC_URLFILTER)
+            logging.info('%r downloaded and parsed', common.PAC_ADBLOCK)
         except Exception as e:
             need_update = False
             logging.exception('update_pacfile failed: %r', e)
@@ -568,6 +565,92 @@ class PacUtil(object):
                     jsLines.append(jsLine)
                 else:
                     jsLines.insert(0, jsLine)
+        function = 'function %s(url, host) {\r\n%s\r\n%sreturn "%s";\r\n}' % (func_name, '\n'.join(jsLines), ' '*indent, default)
+        return function
+
+    @staticmethod
+    def adblock2pac(content, func_name='FindProxyForURLByAdblock', proxy='127.0.0.1:8086', default='DIRECT', indent=4):
+        """adblock list to Pac, based on https://github.com/iamamac/autoproxy2pac"""
+        jsLines = []
+        for line in content.splitlines()[1:]:
+            if not line or line.startswith('!') or '##' in line or '#@#' in line:
+                continue
+            use_proxy = True
+            use_start = False
+            use_end = False
+            use_domain = False
+            use_postfix = []
+            if '$' in line:
+                posfixs = line.split('$')[-1].split(',')
+                if any('domain' in x for x in posfixs):
+                    continue
+                if 'image' in posfixs:
+                    use_postfix += ['.jpg', '.gif']
+                elif 'script' in posfixs:
+                    use_postfix += ['.js']
+                else:
+                    continue
+            line = line.split('$')[0]
+            if line.startswith("@@"):
+                line = line[2:]
+                use_proxy = False
+            if '||' == line[:2]:
+                line = line[2:]
+                use_domain = True
+            elif '|' == line[0]:
+                line = line[1:]
+                use_start = True
+            if line[-1] in ('^', '|'):
+                line = line[:-1]
+                use_end = True
+            return_proxy = 'PROXY %s' % proxy if use_proxy else default
+            line = line.replace('^', '*').strip('*')
+            if use_start and use_end:
+                if '*' in line:
+                    jsLine = 'if (shExpMatch(url, "%s")) return "%s";' % (line, return_proxy)
+                else:
+                    jsLine = 'if (url == "%s") return "%s";' % (line, return_proxy)
+            elif use_start:
+                if '*' in line:
+                    if use_postfix:
+                        jsCondition = ' || '.join('shExpMatch(url, "%s*%s")' % (line, x) for x in use_postfix)
+                        jsLine = 'if (%s) return "%s";' % (jsCondition, return_proxy)
+                    else:
+                        jsLine = 'if (shExpMatch(url, "%s*")) return "%s";' % (line, return_proxy)
+                else:
+                    jsLine = 'if (url.indexOf("%s") == 0) return "%s";' % (line, return_proxy)
+            elif use_domain and use_end:
+                if '*' in line:
+                    jsLine = 'if (shExpMatch(host, "%s*")) return "%s";' % (line, return_proxy)
+                else:
+                    jsLine = 'if (host == "%s") return "%s";' % (line, return_proxy)
+            elif use_domain:
+                if line.split('/')[0].count('.') <= 1:
+                    jsLine = 'if (shExpMatch(url, "http://*.%s*")) return "%s";' % (line, return_proxy)
+                else:
+                    if '*' in line:
+                        if use_postfix:
+                            jsCondition = ' || '.join('shExpMatch(url, "http://%s*%s")' % (line, x) for x in use_postfix)
+                            jsLine = 'if (%s) return "%s";' % (jsCondition, return_proxy)
+                        else:
+                            jsLine = 'if (shExpMatch(url, "http://%s*")) return "%s";' % (line, return_proxy)
+                    else:
+                        if use_postfix:
+                            jsCondition = ' || '.join('shExpMatch(url, "http://%s*%s")' % (line, x) for x in use_postfix)
+                            jsLine = 'if (%s) return "%s";' % (jsCondition, return_proxy)
+                        else:
+                            jsLine = 'if (url.indexOf("http://%s") == 0) return "%s";' % (line, return_proxy)
+            else:
+                if use_postfix:
+                    jsCondition = ' || '.join('shExpMatch(url, "*%s*%s")' % (line, x) for x in use_postfix)
+                    jsLine = 'if (%s) return "%s";' % (jsCondition, return_proxy)
+                else:
+                    jsLine = 'if (shExpMatch(url, "*%s*")) return "%s";' % (line, return_proxy)
+            jsLine = ' ' * indent + jsLine
+            if use_proxy:
+                jsLines.append(jsLine)
+            else:
+                jsLines.insert(0, jsLine)
         function = 'function %s(url, host) {\r\n%s\r\n%sreturn "%s";\r\n}' % (func_name, '\n'.join(jsLines), ' '*indent, default)
         return function
 
@@ -1233,7 +1316,7 @@ class Common(object):
         self.PAC_PORT = self.CONFIG.getint('pac', 'port')
         self.PAC_FILE = self.CONFIG.get('pac', 'file').lstrip('/')
         self.PAC_GFWLIST = self.CONFIG.get('pac', 'gfwlist')
-        self.PAC_URLFILTER = self.CONFIG.get('pac', 'urlfilter')
+        self.PAC_ADBLOCK = self.CONFIG.get('pac', 'adblock')
         self.PAC_EXPIRED = self.CONFIG.getint('pac', 'expired')
 
         self.PAAS_ENABLE = self.CONFIG.getint('paas', 'enable')
@@ -1308,9 +1391,10 @@ class Common(object):
         self.LOVE_ENABLE = self.CONFIG.getint('love', 'enable')
         self.LOVE_TIP = self.CONFIG.get('love', 'tip').encode('utf8').decode('unicode-escape').split('|')
 
-        self.HOSTS = getattr(collections, 'OrderedDict', dict)(self.CONFIG.items('hosts'))
-        self.HOSTS_MATCH = collections.OrderedDict((re.compile(k).search, v) for k, v in self.HOSTS.items() if not re.search(r'\d+$', k))
-        self.HOSTS_CONNECT_MATCH = collections.OrderedDict((re.compile(k).search, v) for k, v in self.HOSTS.items() if re.search(r'\d+$', k))
+        DictType = getattr(collections, 'OrderedDict', dict)
+        self.HOSTS = DictType(self.CONFIG.items('hosts'))
+        self.HOSTS_MATCH = DictType((re.compile(k).search, v) for k, v in self.HOSTS.items() if not re.search(r'\d+$', k))
+        self.HOSTS_CONNECT_MATCH = DictType((re.compile(k).search, v) for k, v in self.HOSTS.items() if re.search(r'\d+$', k))
 
         random.shuffle(self.GAE_APPIDS)
         self.GAE_FETCHSERVER = '%s://%s.appspot.com%s?' % (self.GOOGLE_MODE, self.GAE_APPIDS[0], self.GAE_PATH)
@@ -1540,6 +1624,8 @@ class RangeFetch(object):
                     continue
                 except Exception as e:
                     logging.warning("Response %r in __fetchlet", e)
+                    range_queue.put((start, end, None))
+                    continue
                 if not response:
                     logging.warning('RangeFetch %s return %r', headers['Range'], response)
                     range_queue.put((start, end, None))
@@ -1820,28 +1906,26 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
     def do_METHOD_GAE(self):
         """GAE http urlfetch"""
-        host = self.headers.get('Host', '')
+        request_headers = dict((k.title(), v) for k, v in self.headers.items())
+        host = request_headers.get('Host', '')
         path = self.parsed_url.path
         range_in_query = 'range=' in self.parsed_url.query
         special_range = (any(x(host) for x in common.AUTORANGE_HOSTS_MATCH) or path.endswith(common.AUTORANGE_ENDSWITH)) and not path.endswith(common.AUTORANGE_NOENDSWITH)
-        if 'Range' in self.headers:
-            m = re.search('bytes=(\d+)-', self.headers['Range'])
+        if 'Range' in request_headers:
+            m = re.search('bytes=(\d+)-', request_headers['Range'])
             start = int(m.group(1) if m else 0)
-            self.headers['Range'] = 'bytes=%d-%d' % (start, start+common.AUTORANGE_MAXSIZE-1)
-            logging.info('autorange range=%r match url=%r', self.headers['Range'], self.path)
+            request_headers['Range'] = 'bytes=%d-%d' % (start, start+common.AUTORANGE_MAXSIZE-1)
+            logging.info('autorange range=%r match url=%r', request_headers['Range'], self.path)
         elif not range_in_query and special_range:
-            try:
-                logging.info('Found [autorange]endswith match url=%r', self.path)
-                m = re.search('bytes=(\d+)-', self.headers.get('Range', ''))
-                start = int(m.group(1) if m else 0)
-                self.headers['Range'] = 'bytes=%d-%d' % (start, start+common.AUTORANGE_MAXSIZE-1)
-            except StopIteration:
-                pass
+            logging.info('Found [autorange]endswith match url=%r', self.path)
+            m = re.search('bytes=(\d+)-', request_headers.get('Range', ''))
+            start = int(m.group(1) if m else 0)
+            request_headers['Range'] = 'bytes=%d-%d' % (start, start+common.AUTORANGE_MAXSIZE-1)
 
         payload = b''
-        if 'Content-Length' in self.headers:
+        if 'Content-Length' in request_headers:
             try:
-                payload = self.rfile.read(int(self.headers.get('Content-Length', 0)))
+                payload = self.rfile.read(int(request_headers.get('Content-Length', 0)))
             except NetWorkIOError as e:
                 logging.error('handle_method_urlfetch read payload failed:%s', e)
                 return
@@ -1859,7 +1943,7 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     kwargs['password'] = common.GAE_PASSWORD
                 if common.GAE_VALIDATE:
                     kwargs['validate'] = 1
-                response = self.urlfetch(self.command, self.path, self.headers, payload, fetchserver, **kwargs)
+                response = self.urlfetch(self.command, self.path, request_headers, payload, fetchserver, **kwargs)
                 if not response and retry == common.FETCHMAX_LOCAL-1:
                     html = message_html('502 URLFetch failed', 'Local URLFetch %r failed' % self.path, str(errors))
                     self.wfile.write(b'HTTP/1.0 502\r\nContent-Type: text/html\r\n\r\n' + html.encode('utf-8'))
@@ -1967,10 +2051,13 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
     def do_CONNECT(self):
         """handle CONNECT cmmand, socket forward or deploy a fake cert"""
-        host = self.path.rpartition(':')[0]
+        host, _, port = self.path.rpartition(':')
         if common.HOSTS_CONNECT_MATCH and any(x(self.path) for x in common.HOSTS_CONNECT_MATCH):
             if host.endswith(common.GOOGLE_SITES) and not host.endswith(common.GOOGLE_WITHGAE):
                 http_util.dns.pop(host, None)
+            realhost = next(common.HOSTS_CONNECT_MATCH[x] for x in common.HOSTS_CONNECT_MATCH if x(self.path))
+            if realhost:
+                http_util.dns[host] = list(set(sum([socket.gethostbyname_ex(x)[-1] for x in realhost.split('|')], [])))
             self.do_CONNECT_FWD()
         elif host.endswith(common.GOOGLE_SITES) and not host.endswith(common.GOOGLE_WITHGAE):
             http_util.dns[host] = common.GOOGLE_HOSTS
@@ -2212,7 +2299,7 @@ class PAASProxyHandler(GAEProxyHandler):
 
 class PACServerHandler(BaseHTTPServer.BaseHTTPRequestHandler):
 
-    pacfile = os.path.join(os.path.dirname(__file__), common.PAC_FILE)
+    pacfile = os.path.join(os.path.dirname(os.path.abspath(__file__)), common.PAC_FILE)
     onepixel = b'GIF89a\x01\x00\x01\x00\x80\xff\x00\xc0\xc0\xc0\x00\x00\x00!\xf9\x04\x01\x00\x00\x00\x00,\x00\x00\x00\x00\x01\x00\x01\x00\x00\x02\x02D\x01\x00;'
 
     def address_string(self):
@@ -2237,13 +2324,9 @@ class PACServerHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             else:
                 mimetype = 'application/octet-stream'
             if self.path.endswith('.pac?flush'):
-                thread.start_new_thread(PacUtil.update_pacfile, args=(self.pacfile,))
-            elif time.time() - os.path.getmtime(self.pacfile) > common.PAC_EXPIRED or os.path.getsize(self.pacfile) < 4 * 1024:
-                os.utime(filename, (time.time(), time.time()))
-                if time.time() - os.path.getmtime(self.pacfile) > common.PAC_EXPIRED or os.path.getsize(self.pacfile) < 4 * 1024:
-                    thread.start_new_thread(PacUtil.update_pacfile, args=(self.pacfile,))
-                else:
-                    logging.info('%r is updating by other thread, ignore', filename)
+                thread.start_new_thread(PacUtil.update_pacfile, (self.pacfile,))
+            elif time.time() - os.path.getmtime(self.pacfile) > common.PAC_EXPIRED:
+                thread.start_new_thread(lambda: os.utime(self.pacfile, (time.time(), time.time())) or PacUtil.update_pacfile(self.pacfile), tuple())
             self.send_file(filename, mimetype)
         else:
             self.wfile.write(b'HTTP/1.1 404\r\nContent-Type: text/plain\r\nConnection: close\r\n\r\n404 Not Found')
@@ -2259,7 +2342,7 @@ class PACServerHandler(BaseHTTPServer.BaseHTTPRequestHandler):
             self.wfile.write(data)
 
 
-class DNSServer(getattr(gevent.server, 'DatagramServer', object)):
+class DNSServer(gevent.server.DatagramServer if gevent and hasattr(gevent.server, 'DatagramServer') else object):
     """DNS TCP Proxy based on gevent/dnslib"""
 
     blacklist = set(['1.1.1.1',
@@ -2389,7 +2472,7 @@ def pre_start():
     if common.PAC_ENABLE:
         pac_ip = ProxyUtil.get_listen_ip() if common.PAC_IP in ('', '::', '0.0.0.0') else common.PAC_IP
         url = 'http://%s:%d/%s' % (pac_ip, common.PAC_PORT, common.PAC_FILE)
-        spawn_later(5, lambda x: urllib2.build_opener(urllib2.ProxyHandler({})).open(x), url)
+        spawn_later(600, lambda x: urllib2.build_opener(urllib2.ProxyHandler({})).open(x), url)
     if common.DNS_ENABLE:
         if dnslib is None or gevent.version_info[0] < 1:
             logging.critical('GoAgent DNSServer requires dnslib and gevent 1.0')
