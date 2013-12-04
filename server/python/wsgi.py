@@ -6,6 +6,7 @@
 __version__ = '3.0.7'
 __password__ = ''
 __hostsdeny__ = ()  # __hostsdeny__ = ('.youtube.com', '.youku.com')
+__content_type__ = 'image/gif'
 
 import sys
 import os
@@ -82,76 +83,50 @@ def message_html(title, banner, detail=''):
     return string.Template(MESSAGE_TEMPLATE).substitute(title=title, banner=banner, detail=detail)
 
 
+try:
+    from Crypto.Cipher.ARC4 import new as _Crypto_Cipher_ARC4_new
+except ImportError:
+    logging.warn('Load Crypto.Cipher.ARC4 Failed, Use Pure Python Instead.')
+    class _Crypto_Cipher_ARC4_new(object):
+        def __init__(self, key):
+            x = 0
+            box = range(256)
+            for i, y in enumerate(box):
+                x = (x + y + ord(key[i % len(key)])) & 0xff
+                box[i], box[x] = box[x], y
+            self.__box = box
+            self.__x = 0
+            self.__y = 0
+        def encrypt(self, data):
+            out = []
+            out_append = out.append
+            x = self.__x
+            y = self.__y
+            box = self.__box
+            for char in data:
+                x = (x + 1) & 0xff
+                y = (y + box[x]) & 0xff
+                box[x], box[y] = box[y], box[x]
+                out_append(chr(ord(char) ^ box[(box[x] + box[y]) & 0xff]))
+            self.__x = x
+            self.__y = y
+            return ''.join(out)
+
+
 def rc4crypt(data, key):
-    """RC4 algorithm"""
-    if not key or not data:
-        return data
-    x = 0
-    box = range(256)
-    for i, y in enumerate(box):
-        x = (x + y + ord(key[i % len(key)])) & 0xff
-        box[i], box[x] = box[x], y
-    x = y = 0
-    out = []
-    out_append = out.append
-    for char in data:
-        x = (x + 1) & 0xff
-        y = (y + box[x]) & 0xff
-        box[x], box[y] = box[y], box[x]
-        out_append(chr(ord(char) ^ box[(box[x] + box[y]) & 0xff]))
-    return ''.join(out)
+    return _Crypto_Cipher_ARC4_new(key).encrypt(data) if key else data
 
 
 class RC4FileObject(object):
     """fileobj for rc4"""
     def __init__(self, stream, key):
         self.__stream = stream
-        x = 0
-        box = range(256)
-        for i, y in enumerate(box):
-            x = (x + y + ord(key[i % len(key)])) & 0xff
-            box[i], box[x] = box[x], y
-        self.__box = box
-        self.__x = 0
-        self.__y = 0
-
+        self.__cipher = _Crypto_Cipher_ARC4_new(key) if key else lambda x:x
     def __getattr__(self, attr):
-        if attr not in ('__stream', '__box', '__x', '__y'):
+        if attr not in ('__stream', '__cipher'):
             return getattr(self.__stream, attr)
-
     def read(self, size=-1):
-        out = []
-        out_append = out.append
-        x = self.__x
-        y = self.__y
-        box = self.__box
-        data = self.__stream.read(size)
-        for char in data:
-            x = (x + 1) & 0xff
-            y = (y + box[x]) & 0xff
-            box[x], box[y] = box[y], box[x]
-            out_append(chr(ord(char) ^ box[(box[x] + box[y]) & 0xff]))
-        self.__x = x
-        self.__y = y
-        return ''.join(out)
-
-
-try:
-    from Crypto.Cipher._ARC4 import new as _Crypto_Cipher_ARC4_new
-    def rc4crypt(data, key):
-        return _Crypto_Cipher_ARC4_new(key).encrypt(data) if key else data
-    class RC4FileObject(object):
-        """fileobj for rc4"""
-        def __init__(self, stream, key):
-            self.__stream = stream
-            self.__cipher = _Crypto_Cipher_ARC4_new(key) if key else lambda x:x
-        def __getattr__(self, attr):
-            if attr not in ('__stream', '__cipher'):
-                return getattr(self.__stream, attr)
-        def read(self, size=-1):
-            return self.__cipher.encrypt(self.__stream.read(size))
-except ImportError:
-    pass
+        return self.__cipher.encrypt(self.__stream.read(size))
 
 
 def gae_application(environ, start_response):
@@ -302,11 +277,11 @@ def gae_application(environ, start_response):
          response_headers['Content-Length'] = str(len(data))
     response_headers_data = zlib.compress('\n'.join('%s:%s' % (k.title(), v) for k, v in response_headers.items() if not k.startswith('x-google-')))[2:-4]
     if 'rc4' not in options:
-        start_response('200 OK', [('Content-Type', 'image/gif')])
+        start_response('200 OK', [('Content-Type', __content_type__)])
         yield struct.pack('!hh', int(response.status_code), len(response_headers_data))+response_headers_data
         yield data
     else:
-        start_response('200 OK', [('Content-Type', 'image/gif'), ('X-GOA-Options', 'rc4')])
+        start_response('200 OK', [('Content-Type', __content_type__), ('X-GOA-Options', 'rc4')])
         yield struct.pack('!hh', int(response.status_code), len(response_headers_data))
         yield rc4crypt(response_headers_data, __password__)
         yield rc4crypt(data, __password__)
@@ -323,7 +298,7 @@ class LegacyHandler(object):
         self.start_response = start_response
         return self.process_request()
 
-    def send_response(self, status, headers, content, content_type='image/gif'):
+    def send_response(self, status, headers, content, content_type=__content_type__):
         headers['Content-Length'] = str(len(content))
         strheaders = '&'.join('%s=%s' % (k, v.encode('hex')) for k, v in headers.iteritems() if v)
         #logging.debug('response status=%s, headers=%s, content length=%d', status, headers, len(content))
@@ -526,7 +501,7 @@ def paas_application(environ, start_response):
             response = conn.getresponse()
 
             headers_data = zlib.compress('\n'.join('%s:%s' % (k.title(), v) for k, v in response.getheaders()))[2:-4]
-            start_response('200 OK', [('Content-Type', 'image/gif')])
+            start_response('200 OK', [('Content-Type', __content_type__)])
             yield struct.pack('!hh', int(response.status), len(headers_data))+headers_data
             while 1:
                 data = response.read(8192)
