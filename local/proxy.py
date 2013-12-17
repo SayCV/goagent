@@ -9,7 +9,7 @@
 #      V.E.O             <V.E.O@tom.com>
 #      Max Lv            <max.c.lv@gmail.com>
 #      AlsoTang          <alsotang@gmail.com>
-#      Christopher Meng  <cickumqt@gmail.com>
+#      Christopher Meng  <i@cicku.me>
 #      Yonsm Guo         <YonsmGuo@gmail.com>
 #      Parkman           <cseparkman@gmail.com>
 #      Ming Bai          <mbbill@gmail.com>
@@ -33,9 +33,9 @@
 #      Chen Shuang       <cs0x7f@gmail.com>
 #      cnfuyu            <cnfuyu@gmail.com>
 #      cuixin            <steven.cuixin@gmail.com>
-#      Christopher Meng  <cickumqt@gmail.com>
+#      s2marine0         <s2marine0@gmail.com>
 
-__version__ = '3.1.0'
+__version__ = '3.1.1'
 
 import sys
 import os
@@ -64,6 +64,7 @@ import struct
 import collections
 import zlib
 import functools
+import itertools
 import re
 import io
 import fnmatch
@@ -82,6 +83,7 @@ import SocketServer
 import ConfigParser
 import BaseHTTPServer
 import httplib
+import urllib
 import urllib2
 import urlparse
 try:
@@ -906,7 +908,7 @@ class HTTPUtil(object):
         else:
             self.ssl_context = None
         if self.ssl_validate:
-            self.ssl_context.load_verify_locations(r'cacert.pem')
+            self.ssl_context.load_verify_locations(os.path.join(os.path.dirname(os.path.abspath(__file__)),'cacert.pem'))
             self.ssl_context.set_verify(OpenSSL.SSL.VERIFY_PEER, lambda c, x, e, d, ok: ok)
         if self.ssl_obfuscate:
             self.ssl_ciphers = ':'.join(x for x in self.ssl_ciphers.split(':') if random.random() > 0.5)
@@ -1023,7 +1025,7 @@ class HTTPUtil(object):
                 if not self.ssl_validate:
                     ssl_sock = ssl.wrap_socket(sock, do_handshake_on_connect=False)
                 else:
-                    ssl_sock = ssl.wrap_socket(sock, cert_reqs=ssl.CERT_REQUIRED, ca_certs='cacert.pem', do_handshake_on_connect=False)
+                    ssl_sock = ssl.wrap_socket(sock, cert_reqs=ssl.CERT_REQUIRED, ca_certs=os.path.join(os.path.dirname(os.path.abspath(__file__)),'cacert.pem'), do_handshake_on_connect=False)
                 ssl_sock.settimeout(timeout or self.max_timeout)
                 # start connection time record
                 start_time = time.time()
@@ -1034,9 +1036,10 @@ class HTTPUtil(object):
                 ssl_sock.do_handshake()
                 handshaked_time = time.time()
                 # record TCP connection time
-                self.tcp_connection_time[ipaddr] = connected_time - start_time
+                self.tcp_connection_time[ipaddr] = ssl_sock.tcp_time = connected_time - start_time
                 # record SSL connection time
-                self.ssl_connection_time[ipaddr] = ssl_sock.connection_time = handshaked_time - start_time
+                self.ssl_connection_time[ipaddr] = ssl_sock.ssl_time = handshaked_time - start_time
+                ssl_sock.ssl_time = connected_time - start_time
                 # sometimes, we want to use raw tcp socket directly(select/epoll), so setattr it to ssl socket.
                 ssl_sock.sock = sock
                 # verify SSL certificate.
@@ -1088,9 +1091,9 @@ class HTTPUtil(object):
                 ssl_sock.do_handshake()
                 handshaked_time = time.time()
                 # record TCP connection time
-                self.tcp_connection_time[ipaddr] = connected_time - start_time
+                self.tcp_connection_time[ipaddr] = ssl_sock.tcp_time = connected_time - start_time
                 # record SSL connection time
-                self.ssl_connection_time[ipaddr] = handshaked_time - start_time
+                self.ssl_connection_time[ipaddr] = ssl_sock.ssl_time = handshaked_time - start_time
                 # sometimes, we want to use raw tcp socket directly(select/epoll), so setattr it to ssl socket.
                 ssl_sock.sock = sock
                 # verify SSL certificate.
@@ -1112,11 +1115,12 @@ class HTTPUtil(object):
                 # close tcp socket
                 if sock:
                     sock.close()
-        def _close_ssl_connection(count, queobj):
+        def _close_ssl_connection(count, queobj, first_tcp_time, first_ssl_time):
             for i in range(count):
                 sock = queobj.get()
+                ssl_time_threshold = 1.5 * first_ssl_time
                 if sock and not isinstance(sock, Exception):
-                    if connection_cache_key and i == 0:
+                    if connection_cache_key and sock.ssl_time < ssl_time_threshold:
                         self.ssl_connection_cache[connection_cache_key].put((time.time(), sock))
                     else:
                         sock.close()
@@ -1142,7 +1146,7 @@ class HTTPUtil(object):
             for i in range(len(addrs)):
                 result = queobj.get()
                 if not isinstance(result, Exception):
-                    thread.start_new_thread(_close_ssl_connection, (len(addrs)-i-1, queobj))
+                    thread.start_new_thread(_close_ssl_connection, (len(addrs)-i-1, queobj, result.tcp_time, result.ssl_time))
                     return result
                 else:
                     if i == 0:
@@ -1308,7 +1312,7 @@ class HTTPUtil(object):
             response = None
         return response
 
-    def request(self, method, url, payload=None, headers={}, realhost='', fullurl=False, bufsize=8192, crlf=None, return_sock=None, connection_cache_key=None):
+    def request(self, method, url, payload=None, headers={}, realhost='', bufsize=8192, crlf=None, return_sock=None, connection_cache_key=None):
         scheme, netloc, path, _, query, _ = urlparse.urlparse(url)
         if netloc.rfind(':') <= netloc.rfind(']'):
             # no port number
@@ -1321,6 +1325,8 @@ class HTTPUtil(object):
 
         if 'Host' not in headers:
             headers['Host'] = host
+        if payload and 'Content-Length' not in headers:
+            headers['Content-Length'] = str(len(payload))
 
         for i in range(self.max_retry):
             sock = None
@@ -1400,9 +1406,10 @@ class Common(object):
 
         self.METHOD_REMATCH_MAP = collections.OrderedDict((re.compile(k).match, v) for k, v in self.CONFIG.items(hosts_section) if '\\' in k)
 
+        self.HTTP_WITHGAE = set(self.CONFIG.get(http_section, 'withgae').split('|'))
+        self.HTTP_CRLFSITES = tuple(self.CONFIG.get(http_section, 'crlfsites').split('|'))
         self.HTTP_FORCEHTTPS = set(self.CONFIG.get(http_section, 'forcehttps').split('|'))
         self.HTTP_FAKEHTTPS = set(self.CONFIG.get(http_section, 'fakehttps').split('|'))
-        self.HTTP_WITHGAE = set(self.CONFIG.get(http_section, 'withgae').split('|'))
 
         self.IPLIST_MAP = collections.OrderedDict((k, v.split('|')) for k, v in self.CONFIG.items('iplist'))
         self.IPLIST_MAP.update((k, [k]) for k, v in self.HOSTS_MAP.items() if k == v)
@@ -1414,6 +1421,14 @@ class Common(object):
         self.PAC_GFWLIST = self.CONFIG.get('pac', 'gfwlist')
         self.PAC_ADBLOCK = self.CONFIG.get('pac', 'adblock') if self.CONFIG.has_option('pac', 'adblock') else ''
         self.PAC_EXPIRED = self.CONFIG.getint('pac', 'expired')
+
+        self.PHP_ENABLE = self.CONFIG.getint('php', 'enable')
+        self.PHP_LISTEN = self.CONFIG.get('php', 'listen')
+        self.PHP_PASSWORD = self.CONFIG.get('php', 'password') if self.CONFIG.has_option('php', 'password') else ''
+        self.PHP_CRLF = self.CONFIG.getint('php', 'crlf') if self.CONFIG.has_option('php', 'crlf') else 1
+        self.PHP_VALIDATE = self.CONFIG.getint('php', 'validate') if self.CONFIG.has_option('php', 'validate') else 0
+        self.PHP_FETCHSERVER = self.CONFIG.get('php', 'fetchserver')
+        self.PHP_USEHOSTS = self.CONFIG.getint('php', 'usehosts')
 
         self.PAAS_ENABLE = self.CONFIG.getint('paas', 'enable')
         self.PAAS_LISTEN = self.CONFIG.get('paas', 'listen')
@@ -1544,6 +1559,9 @@ class Common(object):
         if common.PAAS_ENABLE:
             info += 'PAAS Listen        : %s\n' % common.PAAS_LISTEN
             info += 'PAAS FetchServer   : %s\n' % common.PAAS_FETCHSERVER
+        if common.PHP_ENABLE:
+            info += 'PHP Listen         : %s\n' % common.PHP_LISTEN
+            info += 'PHP FetchServer    : %s\n' % common.PHP_FETCHSERVER
         if common.DNS_ENABLE:
             info += 'DNS Listen         : %s\n' % common.DNS_LISTEN
             info += 'DNS Remote         : %s\n' % common.DNS_REMOTE
@@ -1551,7 +1569,7 @@ class Common(object):
         return info
 
 common = Common()
-http_util = HTTPUtil(max_window=common.GAE_WINDOW, ssl_validate=common.GAE_VALIDATE or common.PAAS_VALIDATE, ssl_obfuscate=common.GAE_OBFUSCATE, proxy=common.proxy)
+http_util = HTTPUtil(max_window=common.GAE_WINDOW, ssl_validate=common.GAE_VALIDATE or common.PHP_VALIDATE, ssl_obfuscate=common.GAE_OBFUSCATE, proxy=common.proxy)
 
 
 def message_html(title, banner, detail=''):
@@ -1626,6 +1644,27 @@ class RC4FileObject(object):
         self.__cipher = _Crypto_Cipher_ARC4_new(key) if key else lambda x:x
     def __getattr__(self, attr):
         if attr not in ('__stream', '__cipher'):
+            return getattr(self.__stream, attr)
+    def read(self, size=-1):
+        return self.__cipher.encrypt(self.__stream.read(size))
+
+
+class XORCipher(object):
+    """XOR Cipher Class"""
+    def __init__(self, key):
+        self.__key_gen = itertools.cycle(key).next
+
+    def encrypt(self, data):
+        return ''.join(chr(ord(x) ^ ord(self.__key_gen())) for x in data)
+
+
+class XORFileObject(object):
+    """fileobj for xor"""
+    def __init__(self, stream, key):
+        self.__stream = stream
+        self.__cipher = XORCipher(key)
+    def __getattr__(self, attr):
+        if attr not in ('__stream', '__key_gen'):
             return getattr(self.__stream, attr)
     def read(self, size=-1):
         return self.__cipher.encrypt(self.__stream.read(size))
@@ -1708,10 +1747,10 @@ class RangeFetch(object):
     bufsize = 8192
     threads = 1
     waitsize = 1024*512
-    urlfetch = staticmethod(gae_urlfetch)
     expect_begin = 0
 
-    def __init__(self, wfile, response, method, url, headers, payload, fetchservers, password, maxsize=0, bufsize=0, waitsize=0, threads=0):
+    def __init__(self, urlfetch, wfile, response, method, url, headers, payload, fetchservers, password, maxsize=0, bufsize=0, waitsize=0, threads=0):
+        self.urlfetch = urlfetch
         self.wfile = wfile
         self.response = response
         self.command = method
@@ -1753,7 +1792,7 @@ class RangeFetch(object):
         t0 = time.time()
         cur_threads = 1
         has_peek = hasattr(data_queue, 'peek')
-        peek_timeout = 90
+        peek_timeout = 120
         self.expect_begin = start
         while self.expect_begin < length - 1:
             while cur_threads < self.threads and time.time() - t0 > cur_threads * common.AUTORANGE_MAXSIZE / 1048576:
@@ -1919,7 +1958,7 @@ def expand_google_hk_iplist(domains, max_count=100):
         except socket.error as e:
             logging.debug('expand_google_hk_iplist(%s) error: %r', ip, e)
         except urllib2.HTTPError as e:
-            if e.code == 404 and 'google' in e.headers.get('Server', ''):
+            if e.code == 404 and 'google' in e.headers.get('Server', '').lower():
                 logging.debug('expand_google_hk_iplist(%s) OK', ip)
                 ip_connection_time[(ip, 443)] = time.time() - start_time
             else:
@@ -1946,7 +1985,7 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
     first_run_lock = threading.Lock()
     urlfetch = staticmethod(gae_urlfetch)
     normcookie = functools.partial(re.compile(', ([^ =]+(?:=|$))').sub, '\\r\\nSet-Cookie: \\1')
-    normattachment = functools.partial(re.compile(r'filename=(.+?)').sub, 'filename="\\1"')
+    normattachment = functools.partial(re.compile(r'filename=([^"\']+)').sub, 'filename="\\1"')
 
     def first_run(self):
         """GAEProxyHandler setup, init domain/iplist map"""
@@ -2028,13 +2067,14 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                 common.HOSTS_MAP[host] = hostname
             else:
                 hostname = host
+            need_crlf = hostname.startswith('google_') or host.endswith(common.HTTP_CRLFSITES)
             hostname = hostname or host
             if hostname in common.IPLIST_MAP:
                 http_util.dns[host] = common.IPLIST_MAP[hostname]
             else:
                 http_util.dns[host] = sum((http_util.dns_resolve(x) for x in hostname.split('|')), [])
             connection_cache_key = hostname if host not in common.HTTP_FAKEHTTPS else None
-            response = http_util.request(self.command, self.path, payload, self.headers, crlf=common.GAE_CRLF, connection_cache_key=connection_cache_key)
+            response = http_util.request(self.command, self.path, payload, self.headers, crlf=need_crlf, connection_cache_key=connection_cache_key)
             if not response:
                 return
             logging.info('%s "FWD %s %s HTTP/1.1" %s %s', self.address_string(), self.command, self.path, response.status, response.getheader('Content-Length', '-'))
@@ -2065,12 +2105,12 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         path = self.parsed_url.path
         range_in_query = 'range=' in self.parsed_url.query
         special_range = (any(x(host) for x in common.AUTORANGE_HOSTS_MATCH) or path.endswith(common.AUTORANGE_ENDSWITH)) and not path.endswith(common.AUTORANGE_NOENDSWITH)
-        if 'Range' in request_headers:
+        if self.command != 'HEAD' and 'Range' in request_headers:
             m = re.search(r'bytes=(\d+)-', request_headers['Range'])
             start = int(m.group(1) if m else 0)
             request_headers['Range'] = 'bytes=%d-%d' % (start, start+common.AUTORANGE_MAXSIZE-1)
             logging.info('autorange range=%r match url=%r', request_headers['Range'], self.path)
-        elif not range_in_query and special_range:
+        elif self.command != 'HEAD' and not range_in_query and special_range:
             logging.info('Found [autorange]endswith match url=%r', self.path)
             m = re.search(r'bytes=(\d+)-', request_headers.get('Range', ''))
             start = int(m.group(1) if m else 0)
@@ -2152,7 +2192,7 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     logging.info('%s "GAE %s %s HTTP/1.1" %s %s', self.address_string(), self.command, self.path, response.status, response.getheader('Content-Length', '-'))
                     if response.status == 206:
                         fetchservers = [re.sub(r'//[\w-]+\.appspot\.com', '//%s.appspot.com' % appid, common.GAE_FETCHSERVER) for appid in common.GAE_APPIDS]
-                        rangefetch = RangeFetch(self.wfile, response, self.command, self.path, self.headers, payload, fetchservers, common.GAE_PASSWORD, maxsize=common.AUTORANGE_MAXSIZE, bufsize=common.AUTORANGE_BUFSIZE, waitsize=common.AUTORANGE_WAITSIZE, threads=common.AUTORANGE_THREADS)
+                        rangefetch = RangeFetch(gae_urlfetch, self.wfile, response, self.command, self.path, self.headers, payload, fetchservers, common.GAE_PASSWORD, maxsize=common.AUTORANGE_MAXSIZE, bufsize=common.AUTORANGE_BUFSIZE, waitsize=common.AUTORANGE_WAITSIZE, threads=common.AUTORANGE_THREADS)
                         return rangefetch.fetch()
                     if response.getheader('Set-Cookie'):
                         response.msg['Set-Cookie'] = self.normcookie(response.getheader('Set-Cookie'))
@@ -2241,7 +2281,8 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                         http_util.dns[host] = common.IPLIST_MAP[hostname]
                     else:
                         http_util.dns[host] = sum((http_util.dns_resolve(x) for x in hostname.split('|')), [])
-                    connection_cache_key = '%s:%d' % (hostname or host, port)
+                    #connection_cache_key = '%s:%d' % (hostname or host, port)
+                    connection_cache_key = None
                     timeout = 4
                     remote = http_util.create_connection((host, port), timeout, cache_key=connection_cache_key)
                     if remote is not None and data:
@@ -2332,7 +2373,7 @@ class GAEProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
                     self.__realconnection = None
 
 
-def paas_urlfetch(method, url, headers, payload, fetchserver, **kwargs):
+def php_urlfetch(method, url, headers, payload, fetchserver, **kwargs):
     if payload:
         if len(payload) < 10 * 1024 * 1024 and 'Content-Encoding' not in headers:
             zpayload = zlib.compress(payload)[2:-4]
@@ -2341,40 +2382,143 @@ def paas_urlfetch(method, url, headers, payload, fetchserver, **kwargs):
                 headers['Content-Encoding'] = 'deflate'
         headers['Content-Length'] = str(len(payload))
     skip_headers = http_util.skip_headers
-    if common.PAAS_VALIDATE:
+    if common.PHP_VALIDATE:
         kwargs['validate'] = 1
     metadata = 'G-Method:%s\nG-Url:%s\n%s%s' % (method, url, ''.join('G-%s:%s\n' % (k, v) for k, v in kwargs.items() if v), ''.join('%s:%s\n' % (k, v) for k, v in headers.items() if k not in skip_headers))
     metadata = zlib.compress(metadata)[2:-4]
     app_payload = b''.join((struct.pack('!h', len(metadata)), metadata, payload))
     fetchserver += '?%s' % random.random()
-    crlf = 0 if fetchserver.startswith('https') else common.PAAS_CRLF
+    crlf = 0 if fetchserver.startswith('https') else common.PHP_CRLF
     response = http_util.request('POST', fetchserver, app_payload, {'Content-Length': len(app_payload)}, crlf=crlf)
     if not response:
         raise socket.error(errno.ECONNRESET, 'urlfetch %r return None' % url)
     response.app_status = response.status
+    response.app_transfer_encoding = response.getheader('Transfer-Encoding', '')
     if response.status != 200:
         if response.status in (400, 405):
             # filter by some firewall
-            common.PAAS_CRLF = 0
+            common.PHP_CRLF = 0
         return response
-    data = response.read(4)
-    if len(data) < 4:
-        response.status = 502
-        response.fp = io.BytesIO(b'connection aborted. too short leadtype data=' + data)
-        return response
-    response.status, headers_length = struct.unpack('!hh', data)
-    data = response.read(headers_length)
-    if len(data) < headers_length:
-        response.status = 502
-        response.fp = io.BytesIO(b'connection aborted. too short headers data=' + data)
-        return response
-    response.msg = httplib.HTTPMessage(io.BytesIO(zlib.decompress(data, -zlib.MAX_WBITS)))
+    data = ''
+    while not data.endswith('\r\n\r\n'):
+        data += response.read(1)
+    response.read(2)
+    message = httplib.HTTPMessage(io.BytesIO(data))
+    if message.getheader('Status'):
+        response.status = message.getheader('Status')
+        del message['Status']
+    if response.app_transfer_encoding == 'chunked':
+        message['Transfer-Encoding'] = 'chunked'
+    response.msg = message
+    if kwargs.get('password') and response.fp:
+        response.fp = XORFileObject(response.fp, kwargs['password'][0])
     return response
 
 
+class PHPProxyHandler(GAEProxyHandler):
+
+    urlfetch = staticmethod(php_urlfetch)
+    first_run_lock = threading.Lock()
+
+    def first_run(self):
+        if not common.PROXY_ENABLE:
+            common.resolve_iplist()
+            fetchhost = re.sub(r':\d+$', '', urlparse.urlparse(common.PHP_FETCHSERVER).netloc)
+            logging.info('resolve common.PHP_FETCHSERVER domain=%r to iplist', fetchhost)
+            fethhost_iplist = http_util.dns_resolve(fetchhost)
+            if len(fethhost_iplist) == 0:
+                logging.error('resolve %r domain return empty! please use ip list to replace domain list!', fetchhost)
+                sys.exit(-1)
+            http_util.dns[fetchhost] = list(set(fethhost_iplist))
+            logging.info('resolve common.PHP_FETCHSERVER domain to iplist=%r', fethhost_iplist)
+        return True
+
+    def setup(self):
+        if isinstance(self.__class__.first_run, collections.Callable):
+            try:
+                with self.__class__.first_run_lock:
+                    if isinstance(self.__class__.first_run, collections.Callable):
+                        self.first_run()
+                        self.__class__.first_run = None
+            except NetWorkIOError as e:
+                logging.error('PHPProxyHandler.first_run() return %r', e)
+            except Exception as e:
+                logging.exception('PHPProxyHandler.first_run() return %r', e)
+        self.__class__.setup = BaseHTTPServer.BaseHTTPRequestHandler.setup
+        if common.PHP_USEHOSTS:
+            self.__class__.do_GET = self.__class__.do_METHOD
+            self.__class__.do_PUT = self.__class__.do_METHOD
+            self.__class__.do_POST = self.__class__.do_METHOD
+            self.__class__.do_HEAD = self.__class__.do_METHOD
+            self.__class__.do_DELETE = self.__class__.do_METHOD
+            self.__class__.do_OPTIONS = self.__class__.do_METHOD
+            self.__class__.do_CONNECT = GAEProxyHandler.do_CONNECT
+        else:
+            self.__class__.do_GET = self.__class__.do_METHOD_AGENT
+            self.__class__.do_PUT = self.__class__.do_METHOD_AGENT
+            self.__class__.do_POST = self.__class__.do_METHOD_AGENT
+            self.__class__.do_HEAD = self.__class__.do_METHOD_AGENT
+            self.__class__.do_DELETE = self.__class__.do_METHOD_AGENT
+            self.__class__.do_OPTIONS = self.__class__.do_METHOD_AGENT
+            self.__class__.do_CONNECT = GAEProxyHandler.do_CONNECT_AGENT
+        self.setup()
+
+    def do_METHOD_AGENT(self):
+        try:
+            headers = dict((k.title(), v) for k, v in self.headers.items())
+            host = headers.get('Host', '')
+            payload = b''
+            if 'Content-Length' in headers:
+                try:
+                    payload = self.rfile.read(int(headers.get('Content-Length', 0)))
+                except NetWorkIOError as e:
+                    logging.error('handle_method read payload failed:%s', e)
+                    return
+            response = None
+            errors = []
+            for _ in range(common.FETCHMAX_LOCAL):
+                try:
+                    kwargs = {}
+                    if common.PHP_PASSWORD:
+                        kwargs['password'] = common.PHP_PASSWORD
+                    if common.PHP_VALIDATE:
+                        kwargs['validate'] = 1
+                    response = self.urlfetch(self.command, self.path, headers, payload, common.PHP_FETCHSERVER, **kwargs)
+                    if response:
+                        break
+                except Exception as e:
+                    errors.append(e)
+
+            if response is None:
+                html = message_html('502 php URLFetch failed', 'Local php URLFetch %r failed' % self.path, str(errors))
+                self.wfile.write(b'HTTP/1.0 502\r\nContent-Type: text/html\r\n\r\n' + html.encode('utf-8'))
+                return
+
+            logging.info('%s "PHP %s %s HTTP/1.1" %s -', self.address_string(), self.command, self.path, response.status)
+            if response.app_status in (400, 405):
+                http_util.crlf = 0
+            if response.status == 206:
+                fetchservers = [common.PHP_FETCHSERVER]
+                rangefetch = RangeFetch(php_urlfetch, self.wfile, response, self.command, self.path, self.headers, payload, fetchservers, common.GAE_PASSWORD, maxsize=common.AUTORANGE_MAXSIZE, bufsize=common.AUTORANGE_BUFSIZE, waitsize=common.AUTORANGE_WAITSIZE, threads=common.AUTORANGE_THREADS)
+                return rangefetch.fetch()
+            if response.getheader('Set-Cookie'):
+                response.msg['Set-Cookie'] = self.normcookie(response.getheader('Set-Cookie'))
+            self.wfile.write(('HTTP/1.1 %s\r\n%s\r\n' % (response.status, ''.join('%s: %s\r\n' % (k.title(), v) for k, v in response.getheaders() if k.title() != 'Transfer-Encoding'))))
+
+            while 1:
+                data = response.read(8192)
+                if not data:
+                    break
+                self.wfile.write(data)
+            response.close()
+
+        except NetWorkIOError as e:
+            # Connection closed before proxy return
+            if e.args[0] not in (errno.ECONNABORTED, errno.EPIPE):
+                raise
+
 class PAASProxyHandler(GAEProxyHandler):
 
-    urlfetch = staticmethod(paas_urlfetch)
     first_run_lock = threading.Lock()
 
     def first_run(self):
@@ -2423,51 +2567,46 @@ class PAASProxyHandler(GAEProxyHandler):
     def do_METHOD_AGENT(self):
         try:
             headers = dict((k.title(), v) for k, v in self.headers.items())
-            host = headers.get('Host', '')
-            payload = b''
+            ps_result = urlparse.urlparse(self.path)
+            host = headers.get('Host') or ps_result.netloc
+            if re.search(r':\d+$', host):
+                host, _, port = host.partition(':')
+                port = int(port)
+            else:
+                port = {'https': 443, 'http': 80, 'ftp': 21}.get(ps_result.scheme, 80)
+            headers['Connection'] = 'close'
+            payload = '%s %s HTTP/1.1\r\n' % (self.command, '%s?%s' % (ps_result.path, ps_result.query) if ps_result.query else ps_result.path)
+            payload += ''.join('%s: %s\r\n' % (k, v) for k, v in headers.items())
+            payload += '\r\n'
             if 'Content-Length' in headers:
                 try:
-                    payload = self.rfile.read(int(headers.get('Content-Length', 0)))
+                    payload += self.rfile.read(int(headers.get('Content-Length', 0)))
                 except NetWorkIOError as e:
                     logging.error('handle_method read payload failed:%s', e)
                     return
-            response = None
+            kwargs = {'host': host, 'port': port}
+            if common.PAAS_PASSWORD:
+                kwargs['password'] = common.PAAS_PASSWORD
+            if common.PAAS_VALIDATE:
+                kwargs['validate'] = 1
+            if ps_result.scheme == 'https':
+                kwargs['ssl'] = 1
+            url = '%s?%s' % (common.PAAS_FETCHSERVER.rstrip('?'), base64.b64encode(urllib.urlencode(kwargs)).strip())
+            response = http_util.request('POST', url, payload)
             errors = []
-            for _ in range(common.FETCHMAX_LOCAL):
-                try:
-                    kwargs = {}
-                    if common.PAAS_PASSWORD:
-                        kwargs['password'] = common.PAAS_PASSWORD
-                    if common.PAAS_VALIDATE:
-                        kwargs['validate'] = 1
-                    if common.CONFIG.has_option('hosts', host):
-                        kwargs['hostip'] = random.choice(http_util.dns_resolve(host))
-                    response = self.urlfetch(self.command, self.path, headers, payload, common.PAAS_FETCHSERVER, **kwargs)
-                    if response:
-                        break
-                except Exception as e:
-                    errors.append(e)
-
             if response is None:
                 html = message_html('502 PAAS URLFetch failed', 'Local PAAS URLFetch %r failed' % self.path, str(errors))
                 self.wfile.write(b'HTTP/1.0 502\r\nContent-Type: text/html\r\n\r\n' + html.encode('utf-8'))
                 return
-
             logging.info('%s "PAAS %s %s HTTP/1.1" %s -', self.address_string(), self.command, self.path, response.status)
-            if response.app_status in (400, 405):
+            if response.status in (400, 405):
                 http_util.crlf = 0
-
-            if response.getheader('Set-Cookie'):
-                response.msg['Set-Cookie'] = self.normcookie(response.getheader('Set-Cookie'))
-            self.wfile.write(('HTTP/1.1 %s\r\n%s\r\n' % (response.status, ''.join('%s: %s\r\n' % (k.title(), v) for k, v in response.getheaders() if k.title() != 'Transfer-Encoding'))))
-
             while 1:
                 data = response.read(8192)
                 if not data:
                     break
                 self.wfile.write(data)
             response.close()
-
         except NetWorkIOError as e:
             # Connection closed before proxy return
             if e.args[0] not in (errno.ECONNABORTED, errno.EPIPE):
@@ -2724,6 +2863,11 @@ def main():
     if common.PAAS_ENABLE:
         host, port = common.PAAS_LISTEN.split(':')
         server = LocalProxyServer((host, int(port)), PAASProxyHandler)
+        thread.start_new_thread(server.serve_forever, tuple())
+
+    if common.PHP_ENABLE:
+        host, port = common.PHP_LISTEN.split(':')
+        server = LocalProxyServer((host, int(port)), PHPProxyHandler)
         thread.start_new_thread(server.serve_forever, tuple())
 
     if common.PAC_ENABLE:
