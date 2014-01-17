@@ -1,9 +1,7 @@
 #!/usr/bin/env python
-# coding=utf-8
-# Contributor:
-#      Phus Lu        <phus.lu@gmail.com>
+# coding:utf-8
 
-__version__ = '3.1.2'
+__version__ = '3.1.5'
 __password__ = ''
 __hostsdeny__ = ()  # __hostsdeny__ = ('.youtube.com', '.youku.com')
 __content_type__ = 'image/gif'
@@ -13,6 +11,7 @@ import re
 import time
 import struct
 import zlib
+import gzip
 import base64
 import logging
 import urlparse
@@ -88,22 +87,6 @@ except ImportError:
             return ''.join(out)
 
 
-def rc4crypt(data, key):
-    return RC4Cipher(key).encrypt(data) if key else data
-
-
-class RC4FileObject(object):
-    """fileobj for rc4"""
-    def __init__(self, stream, key):
-        self.__stream = stream
-        self.__cipher = RC4Cipher(key) if key else lambda x:x
-    def __getattr__(self, attr):
-        if attr not in ('__stream', '__cipher'):
-            return getattr(self.__stream, attr)
-    def read(self, size=-1):
-        return self.__cipher.encrypt(self.__stream.read(size))
-
-
 def application(environ, start_response):
     cookie = environ.get('HTTP_COOKIE', '')
     options = environ.get('HTTP_X_GOA_OPTIONS', '')
@@ -119,23 +102,26 @@ def application(environ, start_response):
             yield html.encode('utf8')
         raise StopIteration
 
-    # inflate = lambda x:zlib.decompress(x, -zlib.MAX_WBITS)
+    inflate = lambda x: zlib.decompress(x, -zlib.MAX_WBITS)
+    deflate = lambda x: zlib.compress(x)[2:-4]
+    rc4crypt = lambda s, k: RC4Cipher(k).encrypt(s) if k else s
+
     wsgi_input = environ['wsgi.input']
     input_data = wsgi_input.read()
 
     try:
         if cookie:
             if 'rc4' not in options:
-                metadata = zlib.decompress(base64.b64decode(cookie), -zlib.MAX_WBITS)
+                metadata = inflate(base64.b64decode(cookie))
                 payload = input_data or ''
             else:
-                metadata = zlib.decompress(rc4crypt(base64.b64decode(cookie), __password__), -zlib.MAX_WBITS)
+                metadata = inflate(rc4crypt(base64.b64decode(cookie), __password__))
                 payload = rc4crypt(input_data, __password__) if input_data else ''
         else:
             if 'rc4' in options:
                 input_data = rc4crypt(input_data, __password__)
             metadata_length, = struct.unpack('!h', input_data[:2])
-            metadata = zlib.decompress(input_data[2:2+metadata_length], -zlib.MAX_WBITS)
+            metadata = inflate(input_data[2:2+metadata_length])
             payload = input_data[2+metadata_length:]
         headers = dict(x.split(':', 1) for x in metadata.splitlines() if x)
         method = headers.pop('G-Method')
@@ -151,7 +137,7 @@ def application(environ, start_response):
 
     if 'Content-Encoding' in headers:
         if headers['Content-Encoding'] == 'deflate':
-            payload = zlib.decompress(payload, -zlib.MAX_WBITS)
+            payload = inflate(payload)
             headers['Content-Length'] = str(len(payload))
             del headers['Content-Encoding']
 
@@ -236,7 +222,7 @@ def application(environ, start_response):
     data = response.content
     response_headers = response.headers
     content_type = response_headers.get('content-type', '')
-    if 'content-encoding' not in response_headers and len(response.content) < URLFETCH_DEFLATE_MAXSIZE and content_type.startswith(('text/', 'application/json', 'application/javascript')):
+    if 'content-encoding' not in response_headers and 0 < len(response.content) < URLFETCH_DEFLATE_MAXSIZE and content_type.startswith(('text/', 'application/json', 'application/javascript')):
         if 'gzip' in accept_encoding:
             response_headers['Content-Encoding'] = 'gzip'
             compressobj = zlib.compressobj(zlib.Z_DEFAULT_COMPRESSION, zlib.DEFLATED, -zlib.MAX_WBITS, zlib.DEF_MEM_LEVEL, 0)
@@ -248,10 +234,10 @@ def application(environ, start_response):
             data = dataio.getvalue()
         elif 'deflate' in accept_encoding:
             response_headers['Content-Encoding'] = 'deflate'
-            data = zlib.compress(data)[2:-4]
+            data = deflate(data)
     if data:
         response_headers['Content-Length'] = str(len(data))
-    response_headers_data = zlib.compress('\n'.join('%s:%s' % (k.title(), v) for k, v in response_headers.items() if not k.startswith('x-google-')))[2:-4]
+    response_headers_data = deflate('\n'.join('%s:%s' % (k.title(), v) for k, v in response_headers.items() if not k.startswith('x-google-')))
     if 'rc4' not in options or content_type.startswith(('audio/', 'image/', 'video/')):
         start_response('200 OK', [('Content-Type', __content_type__)])
         yield struct.pack('!hh', int(response.status_code), len(response_headers_data))+response_headers_data
@@ -261,6 +247,108 @@ def application(environ, start_response):
         yield struct.pack('!hh', int(response.status_code), len(response_headers_data))
         yield rc4crypt(response_headers_data, __password__)
         yield rc4crypt(data, __password__)
+
+
+def mirror(environ, start_response):
+    scheme = environ['wsgi.url_scheme']
+    method = environ['REQUEST_METHOD']
+    path_info = environ['PATH_INFO']
+    query_string = environ['QUERY_STRING']
+    original_host = environ['HTTP_HOST']
+
+    logging.info('%s "%s %s %s" - -', environ['REMOTE_ADDR'], method, path_info, 'HTTP/1.1')
+
+    server_name = '.'.join(original_host.split('.')[-3:])
+    target_host = '.'.join(original_host.split('.')[:-3])
+
+    if not target_host and path_info == '/':
+        start_response('200 OK', [('Content-Type', 'text/plain')])
+        yield 'GoAgent Mirror %s\n' % __version__
+        yield 'JTAPI %s is running!\n' % os.environ['CURRENT_VERSION_ID']
+        yield '--------------------------------\n'
+        yield 'Rest Base URL:          %s://api.twitter.com.%s/1.1/\n' % (scheme, server_name)
+        yield 'OAuth Base URL:         %s://api.twitter.com.%s/oauth/\n' % (scheme, server_name)
+        yield '--------------------------------\n'
+        yield 'How to use with Twidere:\n'
+        yield 'Enable "Ignore SSL Error", then set above URLs (It"s better to use HTTPS.)\n'
+        yield '--------------------------------\n'
+        raise StopIteration
+
+    headers = dict((k[5:].title().replace('_', '-'), v) for k, v in environ.items() if k.startswith('HTTP_'))
+    headers['Host'] = target_host
+    path = '%s?%s' % (path_info, query_string) if query_string else path_info
+    url = '%s://%s/%s' % (scheme, target_host, path)
+    payload = environ['wsgi.input'].read() if headers.get('Content-Length') else ''
+
+    fetchmethod = getattr(urlfetch, method, None)
+    if not fetchmethod:
+        start_response('405 Method Not Allowed', [('Content-Type', 'text/html')])
+        yield 'Method Not Allowed: %r' % method
+        raise StopIteration
+
+    deadline = URLFETCH_TIMEOUT
+    errors = []
+    for i in xrange(URLFETCH_MAX):
+        try:
+            response = urlfetch.fetch(url, payload, fetchmethod, headers, allow_truncated=True, follow_redirects=False, deadline=deadline, validate_certificate=False)
+            break
+        except apiproxy_errors.OverQuotaError as e:
+            time.sleep(5)
+        except urlfetch.DeadlineExceededError as e:
+            errors.append('%r, deadline=%s' % (e, deadline))
+            logging.error('DeadlineExceededError(deadline=%s, url=%r)', deadline, url)
+            time.sleep(1)
+            deadline = URLFETCH_TIMEOUT * 2
+        except urlfetch.DownloadError as e:
+            errors.append('%r, deadline=%s' % (e, deadline))
+            logging.error('DownloadError(deadline=%s, url=%r)', deadline, url)
+            time.sleep(1)
+            deadline = URLFETCH_TIMEOUT * 2
+        except urlfetch.ResponseTooLargeError as e:
+            errors.append('%r, deadline=%s' % (e, deadline))
+            response = e.response
+            logging.error('ResponseTooLargeError(deadline=%s, url=%r) response(%r)', deadline, url, response)
+            m = re.search(r'=\s*(\d+)-', headers.get('Range') or headers.get('range') or '')
+            if m is None:
+                headers['Range'] = 'bytes=0-%d' % URLFETCH_MAXSIZE
+            else:
+                headers.pop('Range', '')
+                headers.pop('range', '')
+                start = int(m.group(1))
+                headers['Range'] = 'bytes=%s-%d' % (start, start+URLFETCH_MAXSIZE)
+            deadline = URLFETCH_TIMEOUT * 2
+        except urlfetch.SSLCertificateError as e:
+            errors.append('%r, should validate=0 ?' % e)
+            logging.error('%r, deadline=%s', e, deadline)
+        except Exception as e:
+            errors.append(str(e))
+            if i == 0 and method == 'GET':
+                deadline = URLFETCH_TIMEOUT * 2
+    else:
+        start_response('500 Internal Server Error', [('Content-Type', 'text/plain')])
+        yield 'Internal Server Error'
+        raise StopIteration
+
+    #logging.debug('url=%r response.status_code=%r response.headers=%r response.content[:1024]=%r', url, response.status_code, dict(response.headers), response.content[:1024])
+    response_status = response.status_code
+    response_headers = dict((k.title(), v) for k, v in response.headers.items() if not k.startswith('x-google-'))
+    response_content = response.content
+    content_encoding = response_headers.get('Content-Encoding', '')
+    content_type = response_headers.get('Content-Type', '')
+    if 300 <= response_status < 400 and 'Location' in response_headers and original_host:
+        response_headers['Location'] = re.sub(r'(?<=://)%s(?=/)' % target_host, original_host, response_headers['Location'])
+    if content_encoding in ('gzip', 'deflate'):
+        if content_encoding == 'gzip':
+            response_content = gzip.GzipFile(fileobj=io.BytesIO(response_content)).read()
+        elif content_encoding == 'deflate':
+            response_content = zlib.decompress(response_content, -zlib.MAX_WBITS)
+        del response_headers['Content-Encoding']
+    if 'Content-Encoding' not in response_headers and content_type.startswith(('text/', 'application/json', 'application/javascript', 'application/x-javascript')):
+        response_content = response_content.replace(target_host, original_host)
+        if content_type.startswith('text/html'):
+            response_content = re.sub(r'(?i)//([a-z0-9\-\_\.]+)', '//\\1.%s' % server_name, response_content)
+    start_response(str(response_status), response_headers.items())
+    yield response_content
 
 
 class LegacyHandler(object):
