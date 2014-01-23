@@ -5,6 +5,7 @@ __version__ = '3.1.5'
 __password__ = ''
 __hostsdeny__ = ()  # __hostsdeny__ = ('.youtube.com', '.youku.com')
 __content_type__ = 'image/gif'
+__mirror_userjs__ = ()  # __mirror_userjs__ = '//www.example.com/user.js'
 
 import os
 import re
@@ -263,7 +264,7 @@ def mirror(environ, start_response):
 
     if not target_host and path_info == '/':
         start_response('200 OK', [('Content-Type', 'text/plain')])
-        yield 'GoAgent Mirror %s\n' % __version__
+        yield 'GoAgent Mirror %s\n\n' % __version__
         yield 'JTAPI %s is running!\n' % os.environ['CURRENT_VERSION_ID']
         yield '--------------------------------\n'
         yield 'Rest Base URL:          %s://api.twitter.com.%s/1.1/\n' % (scheme, server_name)
@@ -276,6 +277,9 @@ def mirror(environ, start_response):
 
     headers = dict((k[5:].title().replace('_', '-'), v) for k, v in environ.items() if k.startswith('HTTP_'))
     headers['Host'] = target_host
+    headers.pop('Accept-Encoding', '')
+    if 'Cookie' in headers:
+        headers['Cookie'] = headers['Cookie'].replace(original_host, target_host)
     path = '%s?%s' % (path_info, query_string) if query_string else path_info
     url = '%s://%s/%s' % (scheme, target_host, path)
     payload = environ['wsgi.input'].read() if headers.get('Content-Length') else ''
@@ -326,7 +330,7 @@ def mirror(environ, start_response):
                 deadline = URLFETCH_TIMEOUT * 2
     else:
         start_response('500 Internal Server Error', [('Content-Type', 'text/plain')])
-        yield 'Internal Server Error'
+        yield 'Internal Server Error: %s' % errors
         raise StopIteration
 
     #logging.debug('url=%r response.status_code=%r response.headers=%r response.content[:1024]=%r', url, response.status_code, dict(response.headers), response.content[:1024])
@@ -337,6 +341,8 @@ def mirror(environ, start_response):
     content_type = response_headers.get('Content-Type', '')
     if 300 <= response_status < 400 and 'Location' in response_headers and original_host:
         response_headers['Location'] = re.sub(r'(?<=://)%s(?=/)' % target_host, original_host, response_headers['Location'])
+    if 'Set-Cookie' in response_headers:
+        response_headers['Set-Cookie'] = response_headers['Set-Cookie'].replace(target_host, original_host)
     if content_encoding in ('gzip', 'deflate'):
         if content_encoding == 'gzip':
             response_content = gzip.GzipFile(fileobj=io.BytesIO(response_content)).read()
@@ -346,7 +352,11 @@ def mirror(environ, start_response):
     if 'Content-Encoding' not in response_headers and content_type.startswith(('text/', 'application/json', 'application/javascript', 'application/x-javascript')):
         response_content = response_content.replace(target_host, original_host)
         if content_type.startswith('text/html'):
-            response_content = re.sub(r'(?i)//([a-z0-9\-\_\.]+)', '//\\1.%s' % server_name, response_content)
+            response_content = re.sub(r'(?<=[:\'"]//)([a-z0-9\-\_\.]+)', lambda m: '%s.%s' % (m.group(1), server_name) if not m.group(1).endswith(server_name) else m.group(1), response_content)
+            pos = response_content.find('</body>')
+            if pos > 0 and __mirror_userjs__:
+                script = '\n<script>var _gh_userjs = document.createElement("script");_gh_userjs.setAttribute("src", "%s"); document.getElementsByTagName("head")[0].appendChild(_gh_userjs);</script>\n' % __mirror_userjs__
+                response_content = response_content[:pos] + script + response_content[pos:]
     start_response(str(response_status), response_headers.items())
     yield response_content
 
