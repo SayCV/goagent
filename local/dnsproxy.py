@@ -23,7 +23,7 @@ import logging
 import heapq
 import socket
 import select
-import struct
+import re
 import dnslib
 try:
     import pygeoip
@@ -31,18 +31,24 @@ except ImportError:
     pygeoip = None
 
 
-def win32dns_query_dnsserver_list():
-    import ctypes, ctypes.wintypes, struct, socket
-    DNS_CONFIG_DNS_SERVER_LIST = 6
-    buf = ctypes.create_string_buffer(2048)
-    ctypes.windll.dnsapi.DnsQueryConfig(DNS_CONFIG_DNS_SERVER_LIST, 0, None, None, ctypes.byref(buf), ctypes.byref(ctypes.wintypes.DWORD(len(buf))))
-    ips = struct.unpack('I', buf[0:4])[0]
-    out = []
-    for i in xrange(ips):
-        start = (i+1) * 4
-        out.append(socket.inet_ntoa(buf[start:start+4]))
-    return out
-
+def get_dnsserver_list():
+    if os.name == 'nt':
+        import ctypes, ctypes.wintypes, struct, socket
+        DNS_CONFIG_DNS_SERVER_LIST = 6
+        buf = ctypes.create_string_buffer(2048)
+        ctypes.windll.dnsapi.DnsQueryConfig(DNS_CONFIG_DNS_SERVER_LIST, 0, None, None, ctypes.byref(buf), ctypes.byref(ctypes.wintypes.DWORD(len(buf))))
+        ips = struct.unpack('I', buf[0:4])[0]
+        out = []
+        for i in xrange(ips):
+            start = (i+1) * 4
+            out.append(socket.inet_ntoa(buf[start:start+4]))
+        return out
+    elif os.path.isfile('/etc/resolv.conf'):
+        with open('/etc/resolv.conf', 'rb') as fp:
+            return re.findall(r'(?m)^nameserver\s+(\S+)', fp.read())
+    else:
+        logging.warning("get_dnsserver_list failed: unsupport platform '%s-%s'", sys.platform, os.name)
+        return []
 
 class ExpireCache(object):
     """ A dictionary-like object, supporting expire semantics."""
@@ -109,6 +115,8 @@ class ExpireCache(object):
 class DNSServer(gevent.server.DatagramServer):
     """DNS Proxy based on gevent/dnslib"""
 
+    is_local_addr = re.compile(r'(?i)(?:[0-9a-f:]+0:5efe:)?(?:127(?:\.\d+){3}|10(?:\.\d+){3}|192\.168(?:\.\d+){2}|172\.(?:1[6-9]|2\d|3[01])(?:\.\d+){2})').match
+
     def __init__(self, *args, **kwargs):
         dns_blacklist = kwargs.pop('dns_blacklist')
         dns_servers = kwargs.pop('dns_servers')
@@ -117,18 +125,18 @@ class DNSServer(gevent.server.DatagramServer):
         self.dns_servers = dns_servers
         self.dns_v4_servers = [x for x in self.dns_servers if ':' not in x]
         self.dns_v6_servers = [x for x in self.dns_servers if ':' in x]
-        self.dns_intranet_servers = set([x for x in self.dns_servers if x.startswith(('10.', '172.', '192.168.'))])
+        self.dns_intranet_servers = set([x for x in self.dns_servers if self.is_local_addr(x)])
         self.dns_blacklist = set(dns_blacklist)
         self.dns_timeout = int(dns_timeout)
         self.dns_cache = ExpireCache(max_size=65536)
-        self.dns_trust_servers = set(['8.8.8.8', '8.8.4.4'])
+        self.dns_trust_servers = set(['8.8.8.8', '8.8.4.4', '2001:4860:4860::8888', '2001:4860:4860::8844'])
         if pygeoip:
             for dirname in ('.', '/usr/share/GeoIP/', '/usr/local/share/GeoIP/'):
                 filename = os.path.join(dirname, 'GeoIP.dat')
                 if os.path.isfile(filename):
                     geoip = pygeoip.GeoIP(filename)
                     for dnsserver in self.dns_servers:
-                        if geoip.country_name_by_addr(dnsserver) not in ('China',):
+                        if ':' not in dnsserver and geoip.country_name_by_addr(dnsserver) not in ('China',):
                             self.dns_trust_servers.add(dnsserver)
                     break
 
@@ -209,7 +217,6 @@ class DNSServer(gevent.server.DatagramServer):
 
 def test():
     logging.basicConfig(level=logging.INFO, format='%(levelname)s - %(asctime)s %(message)s', datefmt='[%b %d %H:%M:%S]')
-    # dns_intranet_servers = win32dns_query_dnsserver_list()
     dns_servers = ['114.114.114.114', '114.114.115.115', '8.8.8.8', '8.8.4.4']
     dns_blacklist = '1.1.1.1|255.255.255.255|74.125.127.102|74.125.155.102|74.125.39.102|74.125.39.113|209.85.229.138|4.36.66.178|8.7.198.45|37.61.54.158|46.82.174.68|59.24.3.173|64.33.88.161|64.33.99.47|64.66.163.251|65.104.202.252|65.160.219.113|66.45.252.237|72.14.205.104|72.14.205.99|78.16.49.15|93.46.8.89|128.121.126.139|159.106.121.75|169.132.13.103|192.67.198.6|202.106.1.2|202.181.7.85|203.161.230.171|203.98.7.65|207.12.88.98|208.56.31.43|209.145.54.50|209.220.30.174|209.36.73.33|209.85.229.138|211.94.66.147|213.169.251.35|216.221.188.182|216.234.179.13|243.185.187.3|243.185.187.39'.split('|')
     logging.info('serving at port 53...')
