@@ -41,7 +41,7 @@
 #      v3aqb             <sgzz.cj@gmail.com>
 #      Oling Cat         <olingcat@gmail.com>
 
-__version__ = '3.1.18'
+__version__ = '3.1.19'
 
 import sys
 import os
@@ -975,6 +975,7 @@ class SimpleProxyHandler(BaseHTTPServer.BaseHTTPRequestHandler):
         self.__class__.setup = BaseHTTPServer.BaseHTTPRequestHandler.setup
         self.__class__.do_CONNECT = self.__class__.do_METHOD
         self.__class__.do_GET = self.__class__.do_METHOD
+        self.__class__.do_PATCH = self.__class__.do_METHOD
         self.__class__.do_PUT = self.__class__.do_METHOD
         self.__class__.do_POST = self.__class__.do_METHOD
         self.__class__.do_HEAD = self.__class__.do_METHOD
@@ -2260,6 +2261,7 @@ class CipherFileObject(object):
 
 class LocalProxyServer(SocketServer.ThreadingTCPServer):
     """Local Proxy Server"""
+    request_queue_size = 256
     allow_reuse_address = True
     daemon_threads = True
 
